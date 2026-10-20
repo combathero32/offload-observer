@@ -1,0 +1,16 @@
+config observer 'main'
+    # Your demonstrated LAN. Add every LAN/guest/IPv6 prefix to include.
+    list subnet '192.168.19.0/24'
+    option interval '5'
+    option flow_max '4096'
+    option group_max '512'
+    option socket_path '/var/run/netifyd/netifyd.sock'
+    option country_db '/usr/share/offload-observer/country.mmdb'
+    # Optional: use a station-mode Wi-Fi uplink for the main chart.
+    # Includes all traffic on that link; breakdown counters remain separate.
+    # option uplink_wifi 'phy0-sta0'
+
+# Optional explicit hostname classification; native Netify application labels win.
+# config hostmap
+#     option suffix 'example.com'
+#     option name 'Example service (hostname)'

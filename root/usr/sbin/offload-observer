@@ -1,0 +1,278 @@
+#!/usr/bin/ucode
+// SPDX-License-Identifier: MIT
+import * as fs from 'fs';
+import * as socket from 'socket';
+import * as uloop from 'uloop';
+import * as ubus from 'ubus';
+import { cursor } from 'uci';
+import { ip_key, ip_bytes, in_cidr, in_networks, parse_ct, direction, new_state, sample, label_event } from '/usr/share/ucode/offload-observer/core.uc';
+import { parse_station, new_uplink, sample_uplink } from '/usr/share/ucode/offload-observer/uplink.uc';
+
+function mono() { let c = clock(true); return c[0] + c[1]/1000000000.0; }
+function wall() { return time(); }
+function bounded(n, lo, hi, fallback) { if (n == null) return fallback; n = int(n); return n == null ? fallback : (n < lo ? lo : (n > hi ? hi : n)); }
+function array(v) { return type(v) == 'array' ? v : (v ? [v] : []); }
+function quote(s) { return "'" + replace(s, /'/g, "'\\''") + "'"; }
+function log(s) { fs.stderr.write('offload-observer: '+s+'\n'); fs.stderr.flush(); }
+
+let uci = cursor(), options = uci.get_all('offload_observer', 'main') ?? {};
+let cfg = {
+    networks:array(options.subnet), router_ips:{},
+    flow_max:bounded(options.flow_max,128,16384,4096),
+    group_max:bounded(options.group_max,32,2048,512),
+    interval:bounded(options.interval,2,60,5),
+    database:options.country_db ?? '/usr/share/offload-observer/country.mmdb',
+    socket:options.socket_path ?? '/var/run/netifyd/netifyd.sock',
+    uplink_wifi:options.uplink_wifi ?? ''
+};
+if (length(cfg.uplink_wifi) && !match(cfg.uplink_wifi,/^[A-Za-z0-9_.:-]{1,15}$/)) {
+    log('Invalid uplink_wifi interface name'); exit(1);
+}
+if (!length(cfg.networks)) { log('Configure at least one LAN subnet in /etc/config/offload_observer'); exit(1); }
+for (let cidr in cfg.networks) {
+    let parts = split(cidr,'/');
+    if (!ip_bytes(parts[0]) || !in_cidr(parts[0],cidr)) { log('Invalid LAN subnet: '+cidr); exit(1); }
+}
+let maps = [];
+uci.foreach('offload_observer', 'hostmap', s => push(maps,{suffix:s.suffix,name:s.name}));
+
+let state = new_state(), uplink = new_uplink(), labels = {}, identities = {}, names = {}, countries = {}, leases = {};
+let health = {read_error:null, scan_truncated:false, netify_connected:false, netify_events:0,
+    netify_last_event:null, netify_malformed:0, netify_buffer_resets:0, label_limit:0,
+    country_database:false, country_error:null, baseline_at:null,
+    collector_version:'0.2.4', scan_interval_seconds:cfg.interval, uplink_ms:0,
+    scan_ms:0, scan_max_ms:0, scan_lines:0, netify_polls:0,
+    netify_empty_polls:0, netify_bytes:0, netify_work_ms:0, netify_budget_yields:0};
+let started = wall(), last_sample = mono(), sock = null, buffer = '';
+let conn, published, interval_timer, retry_timer, socket_timer;
+
+function discover_router_ips() {
+    let result = conn.call('network.interface','dump',{}) ?? {};
+    let ips = {};
+    for (let item in (result.interface ?? [])) {
+        for (let field in ['ipv4-address','ipv6-address'])
+            for (let entry in (item[field] ?? [])) if (ip_key(entry.address)) ips[ip_key(entry.address)] = true;
+        for (let entry in (item['ipv6-prefix-assignment'] ?? [])) {
+            let addr = entry['local-address']?.address;
+            if (ip_key(addr)) ips[ip_key(addr)] = true;
+        }
+    }
+    for (let ip in array(options.exclude_ip)) if (ip_key(ip)) ips[ip_key(ip)] = true;
+    cfg.router_ips = ips;
+}
+
+function load_leases() {
+    let text = fs.readfile('/tmp/dhcp.leases') ?? '';
+    leases = {};
+    for (let line in split(text,'\n')) {
+        let parts = split(trim(line),/[[:space:]]+/);
+        if (length(parts) >= 4 && parts[3] != '*' && ip_key(parts[2])) leases[ip_key(parts[2])] = substr(parts[3],0,128);
+    }
+}
+
+function private_address(ip) {
+    return in_networks(ip,['0.0.0.0/8','10.0.0.0/8','100.64.0.0/10','127.0.0.0/8',
+        '169.254.0.0/16','172.16.0.0/12','192.168.0.0/16','224.0.0.0/4','240.0.0.0/4',
+        '::/128','::1/128','fc00::/7','fe80::/10','ff00::/8']);
+}
+
+function lookup_country(ip) {
+    if (!health.country_database) return 'Unknown';
+    // IP parsed above and argv fragments quoted; no data from LuCI can become shell code.
+    let command = '/usr/bin/mmdblookup --file '+quote(cfg.database)+' --ip '+quote(ip)+' country iso_code 2>/dev/null';
+    let pipe = fs.popen(command,'r');
+    if (!pipe) { health.country_error = 'Cannot start mmdblookup'; return 'Unknown'; }
+    let out = pipe.read('all') ?? '';
+    let status = pipe.close();
+    if (status != 0) { health.country_error = 'A country lookup failed; check the MMDB database'; return 'Unknown'; }
+    let code = match(out,/"([A-Z]{2})"/);
+    return code ? code[1] : 'Unknown';
+}
+
+function collect() {
+    let now = mono(), records = [], directions = {}, country_jobs = 0;
+    fs.error();
+    let file = fs.open('/proc/net/nf_conntrack','r');
+    if (!file) { health.read_error = 'Cannot read /proc/net/nf_conntrack'; return; }
+    health.scan_truncated = false;
+    let lines = 0;
+    while (true) {
+        let line = file.read('line');
+        if (line == null || line == '') break;
+        if (++lines > 65536) { health.scan_truncated = true; break; }
+        let ct = parse_ct(line);
+        if (!ct) continue;
+        let dir = direction(ct,cfg.networks,cfg.router_ips);
+        if (!dir) continue;
+        if (length(records) >= cfg.flow_max) { health.scan_truncated = true; continue; }
+        push(records,ct);
+        directions[ct.key] = dir;
+    }
+    health.scan_lines = lines;
+    let read_error = fs.error();
+    file.close();
+    if (read_error) { health.read_error = 'Conntrack read failed: '+read_error; return; }
+    health.read_error = null;
+    health.country_database = fs.stat(cfg.database) != null && fs.stat('/usr/bin/mmdblookup') != null;
+    health.country_error = health.country_database ? null : 'Country database or mmdblookup is absent';
+    for (let ct in records) {
+        let dir = directions[ct.key], key = ip_key(dir.remote);
+        if (countries[key]) continue;
+        if (length(countries) >= 4096) break;
+        if (private_address(dir.remote)) countries[key] = 'Local/private';
+        else if (health.country_database && country_jobs < 2) { countries[key] = lookup_country(dir.remote); country_jobs++; }
+    }
+    // A partial scan must never turn a previously tracked flow into a fresh lifetime count.
+    if (health.scan_truncated) { health.read_error = 'Flow/scan limit reached: sample skipped; increase flow_max'; return; }
+    let touched = sample(state,records,cfg,labels,countries,now-last_sample,0,directions);
+    last_sample = now;
+    if (!health.baseline_at) health.baseline_at = wall();
+    for (let key in touched) labels[key].at = now;
+    for (let key in keys(labels)) if (now-labels[key].at > 120) delete labels[key];
+    for (let key in keys(identities)) if (now-identities[key].at > 120) delete identities[key];
+    if (state.scans % 12 == 1) { discover_router_ips(); load_leases(); }
+}
+
+function read_uplink() {
+    if (!length(cfg.uplink_wifi)) return;
+    let before = mono(), row = null;
+    let pipe = fs.popen('iw dev '+quote(cfg.uplink_wifi)+' station dump 2>/dev/null','r');
+    if (pipe) {
+        let text = pipe.read('all') ?? '', status = pipe.close();
+        if (status == 0) row = parse_station(text);
+    }
+    sample_uplink(uplink,row,mono());
+    health.uplink_ms = (mono()-before)*1000;
+}
+
+function scan() {
+    let before = mono();
+    collect();
+    // This source continues independently even if a conntrack scan fails.
+    read_uplink();
+    health.scan_ms = (mono()-before)*1000;
+    if (health.scan_ms > health.scan_max_ms) health.scan_max_ms = health.scan_ms;
+}
+
+function feed(line) {
+    let ev;
+    try { ev = json(line); } catch (e) { health.netify_malformed++; return; }
+    if (type(ev) != 'object' || !ev.type) return;
+    health.netify_events++; health.netify_last_event = wall();
+    for (let item in label_event(ev,names,maps,mono(),identities)) {
+        if (length(labels) >= 8192 && !labels[item.key]) { health.label_limit++; continue; }
+        let old = labels[item.key];
+        if (!old || item.label.rank >= old.rank) labels[item.key] = item.label;
+    }
+}
+
+let connect_netify, disconnect_netify;
+function on_readable() {
+    if (!sock) return;
+    // A timer polls this nonblocking socket. No fd readiness watcher can spin.
+    // Read at most 64 KiB per poll, then yield for at least 250 ms.
+    health.netify_polls++;
+    for (let i = 0; i < 4; i++) {
+        let data = sock.recv(16384,socket.MSG_DONTWAIT);
+        if (data == null) {
+            let err = socket.error(true);
+            if (err == 11 || err == 4) health.netify_empty_polls++;
+            else disconnect_netify();
+            return;
+        }
+        if (!length(data)) { disconnect_netify(); return; }
+        health.netify_bytes += length(data);
+        buffer += data;
+        if (length(buffer) > 262144) { buffer = ''; health.netify_buffer_resets++; continue; }
+        let parts = split(buffer,'\n'); buffer = parts[length(parts)-1];
+        for (let j = 0; j < length(parts)-1; j++) if (length(trim(parts[j]))) feed(parts[j]);
+        if (length(data) < 16384) return;
+    }
+    health.netify_budget_yields++;
+}
+disconnect_netify = function() {
+    if (sock) { sock.close(); sock = null; }
+    buffer = ''; health.netify_connected = false;
+    if (!retry_timer) retry_timer = uloop.timer(5000, function() { retry_timer = null; connect_netify(); });
+};
+connect_netify = function() {
+    let path = cfg.socket;
+    if (path == '/var/run/netifyd/netifyd.sock' && fs.stat('/var/run/netifyd/netify-sink.sock')) path = '/var/run/netifyd/netify-sink.sock';
+    sock = socket.connect(path);
+    if (!sock) { disconnect_netify(); return; }
+    health.netify_connected = true;
+};
+
+function poll_netify() {
+    let before = mono();
+    on_readable();
+    health.netify_work_ms += (mono()-before)*1000;
+    socket_timer.set(250);
+}
+
+function scheduled_scan() {
+    scan();
+    // Rearm after completion, avoiding timer catch-up after slow scans/lookups.
+    interval_timer.set(cfg.interval*1000);
+}
+
+function rows(table, client_names) {
+    let out = [];
+    for (let key in table) {
+        let row = {...table[key]};
+        row.label = client_names ? (leases[ip_key(key)] ?? key) : key;
+        push(out,row);
+    }
+    sort(out,(a,b) => (b.down+b.up)-(a.down+a.up));
+    return slice(out,0,100);
+}
+function report() {
+    let unknown = state.applications.Unknown;
+    let overflow = state.applications['Other (table limit)'];
+    let bytes = state.total.up+state.total.down;
+    let wifi = length(cfg.uplink_wifi) > 0;
+    let sampled = wifi ? (uplink.last_at != null ? wall()-int(mono()-uplink.last_at) : null) :
+        (health.baseline_at ? wall()-int(mono()-last_sample) : null);
+    return {
+        version:'0.2.4', started_at:started, sampled_at:sampled,
+        scope:wifi ? 'Entire Wi-Fi uplink station traffic, including router traffic and every client using this link.' :
+            'Observed counter increments between consecutive sightings. First-sighting bytes, missed flows and final bytes are excluded.',
+        rate_unit:'bytes/second',
+        total:wifi ? uplink.total : state.total, rates:wifi ? uplink.rates : state.rates,
+        measurement:{source:wifi ? 'wifi_station' : 'conntrack',interface:wifi ? cfg.uplink_wifi : null,
+            valid:wifi ? uplink.valid : health.read_error == null,error:wifi ? uplink.error : health.read_error},
+        breakdown_source:'conntrack',breakdowns_verified:false,
+        raw_conntrack:{total:state.total,rates:state.rates},
+        clients:rows(state.clients,true), applications:rows(state.applications,false), countries:rows(state.countries,false),
+        application_coverage:bytes ? 100.0*(bytes-(unknown ? unknown.up+unknown.down : 0)-(overflow ? overflow.up+overflow.down : 0))/bytes : 0,
+        health:{...health, uptime_seconds:wall()-started, scans:state.scans, active_flows:state.active, hw_flows:state.hw,
+            measurement_source:wifi ? 'wifi_station' : 'conntrack',uplink_wifi:cfg.uplink_wifi,
+            uplink_valid:uplink.valid,uplink_error:uplink.error,uplink_resets:uplink.resets,
+            uplink_samples:uplink.samples,uplink_delta:uplink.delta,uplink_elapsed_seconds:uplink.elapsed,
+            tracked:state.tracked,counter_resets:state.counter_resets,label_cache:length(labels),networks:cfg.networks,
+            flows_baselined:state.flows_baselined,last_flows_baselined:state.last_flows_baselined,
+            missing_flows:state.missing_flows,sample_delta:state.sample_delta,
+            sample_elapsed_seconds:state.sample_elapsed_seconds,
+            largest_baseline:state.largest_baseline,largest_counted_delta:state.largest_counted_delta,
+            country_cache_full:length(countries)>=4096,
+            aggregate_limit:state.clients['Other (table limit)'] != null || overflow != null,
+            rows_limited: length(state.clients)>100 || length(state.applications)>100 || length(state.countries)>100}
+    };
+}
+
+uloop.init();
+conn = ubus.connect();
+if (!conn) { log('Cannot connect to ubus'); exit(1); }
+discover_router_ips(); load_leases();
+published = conn.publish('offload_observer', {
+    summary:{args:{ubus_rpc_session:''},call:request => report()},
+    status:{args:{ubus_rpc_session:''},call:request => report().health}
+});
+if (!published) { log('Cannot publish offload_observer'); exit(1); }
+scan(); connect_netify();
+interval_timer = uloop.timer(cfg.interval*1000,scheduled_scan);
+socket_timer = uloop.timer(250,poll_netify);
+uloop.signal(15,() => uloop.end());
+uloop.signal(2,() => uloop.end());
+uloop.run();
+uloop.done();

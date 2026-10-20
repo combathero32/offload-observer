@@ -1,0 +1,8 @@
+{
+  "admin/status/offload_observer": {
+    "title": "Offload Observer",
+    "order": 35,
+    "action": { "type": "view", "path": "offload_observer/index" },
+    "depends": { "acl": ["luci-app-offload-observer"] }
+  }
+}

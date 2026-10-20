@@ -1,0 +1,8 @@
+{
+  "luci-app-offload-observer": {
+    "description": "Read Offload Observer usage summaries",
+    "read": {
+      "ubus": { "offload_observer": ["summary", "status"] }
+    }
+  }
+}

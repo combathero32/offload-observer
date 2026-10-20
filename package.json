@@ -1,0 +1,17 @@
+{
+  "name": "offload-observer",
+  "version": "0.2.4",
+  "private": true,
+  "license": "MIT",
+  "description": "Experimental OpenWrt offload-aware traffic observer",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node scripts/test.cjs",
+    "test:ui": "node tests/frontend.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

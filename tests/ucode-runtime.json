@@ -1,0 +1,15 @@
+{
+  "source": "https://try.ucode-lang.org/",
+  "files": [
+    {
+      "name": "ucode.js",
+      "url": "https://try.ucode-lang.org/ucode.js",
+      "sha256": "ffcb7199908a5edfafd71fed3674d49bcfe10ddb0d1998bdba1127559d5e941c"
+    },
+    {
+      "name": "ucode.wasm",
+      "url": "https://try.ucode-lang.org/ucode.wasm",
+      "sha256": "f0474e5fd662eaabc53c425ee9cad1f596b5fc07d3a51859edbbdc7470305e86"
+    }
+  ]
+}

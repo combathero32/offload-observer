@@ -1,0 +1,32 @@
+let checks=0;
+function ok(value,message){if(!value)die(message+'\n');checks++;}
+function row(rx,tx,connected){return parse_station(sprintf('Station 02:00:00:00:00:01 (on phy0-sta0)\n rx bytes: %d\n tx bytes: %d\n connected time: %d seconds\n',rx,tx,connected));}
+let a=row(1947326803,1976832077,7817),b=row(1948359633,2020953834,7823),c=row(1949543549,2065175124,7829);
+ok(a.up==1976832077 && a.down==1947326803,'station directions');
+let s=new_uplink();
+sample_uplink(s,a,1792508874.690);
+ok(!s.valid && s.total.up==0,'first reading is baseline');
+sample_uplink(s,b,1792508880.704);
+ok(s.valid && s.delta.up==44121757 && s.delta.down==1032830,'actual first supplied interval');
+ok(s.rates.up*8/1e6 >58 && s.rates.up*8/1e6<59,'supplied interval is about 58.7 Mbps');
+sample_uplink(s,c,1792508886.722);
+ok(s.total.up==88343047 && s.total.down==2216746,'actual supplied cumulative increments');
+let total=s.total.up;
+sample_uplink(s,c,1792508892.722);
+ok(s.valid && s.delta.up==0 && s.total.up==total,'idle counters add nothing');
+sample_uplink(s,null,1792508898.722);
+ok(!s.valid && s.rates.up==null && s.error!=null,'read failure is unavailable not zero');
+sample_uplink(s,{...c,up:c.up+1000000000},1792508904.722);
+ok(!s.valid && s.total.up==total,'recovery does not import traffic across gap');
+sample_uplink(s,{...c,up:c.up+1000000000},1792508910.722);
+ok(s.valid && s.total.up==total,'recovered source resumes');
+sample_uplink(s,row(10,20,1),1792508916.722);
+ok(!s.valid && s.resets==1 && s.total.up==total,'counter reset baselines');
+sample_uplink(s,{...row(100,200,7),peer:'aa:bb:cc:dd:ee:ff'},1792508922.722);
+ok(!s.valid && s.resets==2,'peer change baselines');
+sample_uplink(s,{...row(1000,2000,1),peer:'aa:bb:cc:dd:ee:ff'},1792508928.722);
+ok(!s.valid && s.resets==3,'same peer reconnection baselines');
+ok(parse_station('Station 02:00:00:00:00:01 (on phy0-sta0)\n tx bytes: 5\n')==null,'missing RX rejected');
+ok(parse_station('Station 02:00:00:00:00:01 (on phy0-sta0)\n rx bytes: -1\n tx bytes: 2\n')==null,'negative counter rejected');
+ok(parse_station('Station aa:bb:cc:dd:ee:ff (on test)\n rx bytes: 1\n tx bytes: 2\nStation bb:bb:cc:dd:ee:ff (on test)\n rx bytes: 1\n tx bytes: 2\n')==null,'multiple peers rejected');
+printf('PASS: %d uplink checks\n',checks);
